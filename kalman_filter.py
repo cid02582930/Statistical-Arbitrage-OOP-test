@@ -13,67 +13,29 @@ class KalmanState:
     beta: float
     cov: np.ndarray
 
-
 class OnlineKalmanSpreadTracker:
-    def __init__(
-        self,
-        delta_noise: float = 1e-4,
-        obs_variance: float = 1e-3,
-        initial_beta: float = 1.0,
-    ) -> None:
-        """
-        Parameters
-        ----------
-        delta_noise : float
-            Process variance tuning parameter scaling W.
-        obs_variance : float
-            Observation variance V.
-        """
-        self.obs_variance = obs_variance
-        # State transition: identity random walk
+    def __init__(self, process_var: float = 1e-8, obs_var: float = 1e-2) -> None:
         # theta = [alpha, beta]^T
-        self.state_mean = np.array([0.0, initial_beta], dtype=np.float64)
-        # Prior state covariance
-        self.state_cov = np.eye(2, dtype=np.float64) * 1.0
-        # Process noise covariance W
-        self.process_noise = (delta_noise / (1.0 - delta_noise)) * np.eye(2, dtype=np.float64)
+        self.state = np.array([0.0, 1.0], dtype=np.float64)
+        self.cov = np.eye(2, dtype=np.float64) * 0.1
+        # set W low decouple macro beta drift from mean-reverting spread
+        self.W = np.eye(2, dtype=np.float64) * process_var
+        self.V = obs_var
 
-    def step(self, y_val: float, x_val: float) -> tuple[float, float, float]:
-        """
-        Processes a single online bar observation (y_t, x_t).
-        
-        Returns
-        -------
-        spread_t : float
-            The estimated residual innovation error (y_t - y_hat_t).
-        alpha_t : float
-            Updated intercept.
-        beta_t : float
-            Updated hedge ratio.
-        """
-        # 1. State Prediction (Time Update)
-        theta_pred = self.state_mean.copy()
-        cov_pred = self.state_cov + self.process_noise
+    def update(self, log_y: float, log_x: float) -> tuple[float, float, float]:
+        state_pred = self.state.copy()
+        cov_pred = self.cov + self.W
 
-        # 2. Measurement Vector H_t = [1.0, x_val]
-        h_matrix = np.array([1.0, x_val], dtype=np.float64)
+        H = np.array([1.0, log_x], dtype=np.float64)
+        y_hat = float(np.dot(H, state_pred))
+        innovation = log_y - y_hat
+        F = float(H @ cov_pred @ H.T + self.V)
 
-        # 3. Measurement Prediction & Innovation
-        y_hat = float(np.dot(h_matrix, theta_pred))
-        innovation = float(y_val - y_hat)
+        K = (cov_pred @ H) / F
+        self.state = state_pred + K * innovation
+        self.cov = cov_pred - np.outer(K, H @ cov_pred)
 
-        # 4. Innovation Covariance F_t = H P H^T + V
-        innovation_cov = float(h_matrix @ cov_pred @ h_matrix.T + self.obs_variance)
+        alpha, beta = self.state[0], self.state[1]
 
-        # 5. Kalman Gain K_t = P H^T / F_t
-        kalman_gain = (cov_pred @ h_matrix) / innovation_cov
-
-        # 6. Posterior State Update
-        self.state_mean = theta_pred + kalman_gain * innovation
-        self.state_cov = cov_pred - np.outer(kalman_gain, h_matrix @ cov_pred)
-
-        current_alpha = float(self.state_mean[0])
-        current_beta = float(self.state_mean[1])
-
-        return innovation, current_alpha, current_beta
-    
+        spread = log_y - (alpha + beta * log_x)
+        return spread, alpha, beta

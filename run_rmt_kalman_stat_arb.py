@@ -9,158 +9,107 @@ Quantitative pipeline execute:
 
 import numpy as np
 import pandas as pd
+from statsmodels.tsa.stattools import adfuller
 from spectral_denoising import MarchenkoPasturFilter
-from kalman_filter import OnlineKalmanSpreadTracker
-from ou_calibration import OrnsteinUhlenbeckEstimator
 from stat_arb_backtester import PairsBacktester, BacktestConfig
 
-
-def generate_synthetic_market_data(
-    num_assets: int = 50, num_days: int = 1000, seed: int = 42
-) -> tuple[pd.DataFrame, tuple[str, str]]:
+def generate_synthetic_market_data(num_assets: int = 30, num_days: int = 1000, seed: int = 42):
     np.random.seed(seed)
+    dt = 1.0 / 252.0
+
     # generate common latent macro factors
     t = num_days
-    factor_market = np.cumsum(np.random.normal(0.0002, 0.01, size=t))
-    factor_sector = np.cumsum(np.random.normal(0.0, 0.008, size=t))
+    factor_market = np.exp(np.cumsum(np.random.normal(0.0003, 0.012, size=t)))
+    factor_sector = np.exp(np.cumsum(np.random.normal(0.0001, 0.009, size=t)))
 
     prices = {}
     for i in range(num_assets):
-        idio = np.cumsum(np.random.normal(0.0, 0.015, size=t))
-        # loading on systemic factors
-        p = np.exp(1.0 + 0.6 * factor_market + 0.4 * factor_sector + idio)
-        prices[f"ASSET_{i:02d}"] = p
+        beta_m = np.random.uniform(0.6, 1.4)
+        beta_s = np.random.uniform(0.3, 1.1)
+        idio = np.exp(np.cumsum(np.random.normal(0.0, 0.012, size=num_days)))
+        prices[f"TICKER_{i:02d}"] = 40.0 * (factor_market ** beta_m) * (factor_sector ** beta_s) * idio
 
-    # inject non-stationary cointegrated pair with time-varying beta and OU spread
-    time_steps = np.linspace(0, 4.0, t)
-    drifting_beta = 1.2 + 0.3 * np.sin(2.0 * np.pi * time_steps / 3.0)
-    drifting_alpha = 0.5 + 0.1 * time_steps
+    # cointegrated pairs inject
+    pair_anchors = [(0, 1 ), (2, 3), (4, 5), (6, 7), (8, 9)]
+    for idx_y, idx_x in pair_anchors:
+        theta = np.random.uniform(12.0, 24.0) # fast half-life: ~7 to 15 days
+        sigma_ou = 0.18
+        spread = np.zeros(num_days)
 
-    # generate synthetic OU spread process: dS = 12 * (0 - S) dt + 0.2 dW
-    spread = np.zeros(t)
-    theta_true = 12.0
-    sigma_true = 0.25
-    dt = 1.0 / 252.0
+        for t in range(1, num_days):
+            spread[t] = spread[t - 1] - theta * spread[t - 1] * dt + sigma_ou * np.random.normal(0, np.sqrt(dt))
 
-    for step in range(1, t):
-        dW = np.random.normal(0, np.sqrt(dt))
-        spread[step] = (
-            spread[step - 1]
-            - theta_true * spread[step - 1] * dt
-            + sigma_true * dW
-        )
+            # log space pair link
+            px_val = prices[f"TICKER_{idx_x:02d}"]
+            prices[f"TICKER_{idx_y:02d}"] = np.exp(0.3 + 1.15 * np.log(px_val) + spread)
 
-    # asset A depends dynamically on Asset B + synthetic spread
-    p_b = prices["ASSET_00"]
-    p_a = drifting_alpha + drifting_beta * p_b + spread
-    prices["ASSET_PA"] = p_a
-    prices["ASSET_PB"] = p_b
+    return pd.DataFrame(prices), pair_anchors
 
-    df_prices = pd.DataFrame(prices)
-    return df_prices, ("ASSET_PA", "ASSET_PB")
+def run_pipeline() -> None:
+    print("[1/4] Generating Multi-Asset Synthetic Market (N=30, T=1000bars)...")
+    df_prices, true_pairs = generate_synthetic_market_data(num_assets=30, num_days=1000, seed=123)
 
+    print("[2/4] Spectral Correlation Matrix Filtering via RMT...")
+    log_returns = np.log(df_prices).diff().dropna()
+    c_raw = log_returns.corr().to_numpy()
+    q_ratio = float(len(log_returns)) / float(df_prices.shape[1])
 
-def main() -> None:
-    print("[1/5] Synthesizing Multi-Asset Universe & Structural Pairs...")
-    num_assets = 40
-    lookback = 1000
-    df_prices, target_pair = generate_synthetic_market_data(
-        num_assets=num_assets, num_days=lookback, seed=101
-    )
-    asset_y, asset_x = target_pair
-
-    # calculate returns for spectral de-noising verification
-    returns = df_prices.pct_change().dropna()
-    t_samples, n_dims = returns.shape
-    q_ratio = float(t_samples) / float(n_dims)
-
-    print(f"[2/5] Running Marchenko-Pastur Spectral Filter (Q = {q_ratio:.2f})...")
-    raw_corr = returns.corr().to_numpy()
     mp_filter = MarchenkoPasturFilter(q_factor=q_ratio)
-    cleaned_corr = mp_filter.denoise_correlation_matrix(raw_corr)
+    cleaned_corr = mp_filter.denoise(c_raw)
 
-    # spectral diagnostic verify
-    orig_evals = np.linalg.eigvalsh(raw_corr)
-    cleaned_evals = np.linalg.eigvalsh(cleaned_corr)
-    bounds = mp_filter.compute_theoretical_bounds(sigma_sq=1.0)
-    print(f"      MP Threshold (lambda_max): {bounds.lambda_max:.4f}")
-    print(f"      Raw Max Eigenvalue: {orig_evals.max():.4f}")
-    print(f"      Preserved Signal Eigenvalues: {int(np.sum(orig_evals > bounds.lambda_max))}")
-    print(f"      Denoised Condition Number: {np.linalg.cond(cleaned_corr):.4f}")
+    print("[3/4] Screening Cointegrated Pairs via De-noised Metric Distance...")
+    # used distance matrix D = sqrt(2*(1 - c_clean))
+    dist_matrix = np.sqrt(np.maximum(2.0 * (1.0 - cleaned_corr), 0.0))
+    np.fill_diagonal(dist_matrix, np.inf)
 
-    print(f"[3/5] Initializing Online Kalman State-Space Model on ({asset_y}, {asset_x})...")
-    py_series = df_prices[asset_y].to_numpy()
-    px_series = df_prices[asset_x].to_numpy()
+    # identify pairs with highest correlation in de-noised space
+    screened_pairs = []
+    tickers = list(df_prices.columns)
+    visited = set()
 
-    kalman = OnlineKalmanSpreadTracker(
-        delta_noise=1e-5, obs_variance=1e-3, initial_beta=1.0
-    )
-    ou_estimator = OrnsteinUhlenbeckEstimator(dt=1.0 / 252.0)
+    for i in range(len(tickers)):
+        if i in visited:
+            continue
+        best_j = int(np.argmin(dist_matrix[i]))
+        if best_j not in visited and dist_matrix[i, best_j] < 0.65: # find high correlation
+            # validate stationarity via ADF test on OLS log-price residuals
+            p_y = np.log(df_prices[tickers[i]].to_numpy())
+            p_x = np.log(df_prices[tickers[best_j]].to_numpy())
+            beta_est = np.cov(p_y, p_x)[0, 1] / np.var(p_x)
+            resids = p_y - beta_est * p_x
+            adf_stat, adf_pvalue, *_ = adfuller(resids)
 
-    spread_history = np.zeros(lookback)
-    beta_history = np.zeros(lookback)
-    alpha_history = np.zeros(lookback)
-    half_life_history = np.zeros(lookback)
-    z_score_history = np.zeros(lookback)
+            if adf_pvalue < 0.05: # stationary verified
+                screened_pairs.append((tickers[i], tickers[best_j]))
+                visited.add(i)
+                visited.add(best_j)
 
-    # 40-day rolling calibration window for running z-scores & OU parameters
-    rolling_ou_window = 40
+    print(f"     Verified Cointegrated Basket: {screened_pairs}")
 
-    for t in range(lookback):
-        spread_t, alpha_t, beta_t = kalman.step(py_series[t], px_series[t])
-        spread_history[t] = spread_t
-        beta_history[t] = beta_t
-        alpha_history[t] = alpha_t
-
-        if t >= rolling_ou_window:
-            local_window = spread_history[t - rolling_ou_window : t]
-            ou_params = ou_estimator.fit(local_window)
-            if ou_params.is_valid:
-                half_life_history[t] = ou_params.half_life
-            else:
-                half_life_history[t] = np.inf
-
-            local_mean = np.mean(local_window)
-            local_std = np.std(local_window)
-            z_score_history[t] = (
-                (spread_t - local_mean) / local_std if local_std > 1e-6 else 0.0
-            )
-        else:
-            half_life_history[t] = np.inf
-            z_score_history[t] = 0.0
-
-    print("[4/5] Executing Event-Driven Backtester with Microstructure Friction...")
-    config = BacktestConfig(
-        entry_z=1.75,
-        exit_z=0.25,
-        stop_loss_z=3.5,
+    print("[4/4] Running Multi-Pair Execution Engine with Realistic Friction...")
+    cfg = BacktestConfig(
+        entry_z=1.80,
+        exit_z=0.20,
+        stop_loss_z=3.50,
         slippage_bps=3.0,
         borrow_rate_annual=0.015,
         capital_allocation=1_000_000.0,
     )
-
-    backtester = PairsBacktester(config)
-    results_df, metrics = backtester.run(
-        prices_y=py_series,
-        prices_x=px_series,
-        spread_series=spread_history,
-        betas=beta_history,
-        ou_half_lives=half_life_history,
-        z_scores=z_score_history,
-    )
-
+    engine = PairsBacktester(config=cfg)
+    wealth_df, metrics = engine.run(df_prices, screened_pairs)
+       
     print("\n" + "=" * 60)
     print("                 PERFORMANCE METRICS REPORT                 ")
     print("=" * 60)
-    print(f" Total return:              {metrics.total_return * 100.0:>10.2f} %")
-    print(f" CAGR:                      {metrics.cagr * 100.0:>10.2f} %")
-    print(f" Annualized volatility:     {metrics.annualized_volatility * 100.0:>10.2f} %")
-    print(f" Sharpe ratio (Rf=2.0%):    {metrics.sharpe_ratio:>10.2f}")
-    print(f" Maximum drawdown:          {metrics.max_drawdown * 100.0:>10.2f} %")
-    print(f" Total completed trades:    {metrics.total_trades:>10d}")
-    print(f" Realized win rate:         {metrics.win_rate * 100.0:>10.2f} %")
+    print(f" Total Return:              {metrics['Total Return'] * 100.0:>10.2f} %")
+    print(f" CAGR:                      {metrics['CAGR'] * 100.0:>10.2f} %")
+    print(f" Annualized Volatility:     {metrics['Annualized Volatility'] * 100.0:>10.2f} %")
+    print(f" Sharpe Ratio (Rf=2.0%):    {metrics['Sharpe Ratio']:>10.2f}")
+    print(f" Maximum Drawdown:          {metrics['Max Drawdown'] * 100.0:>10.2f} %")
+    print(f" Total Completed Trades:    {metrics['Completed Trades']:>10d}")
+    print(f" Realized Win Rate:         {metrics['Win Rate'] * 100.0:>10.2f} %")
     print("=" * 60)
 
 
 if __name__ == "__main__":
-    main()
+    run_pipeline()

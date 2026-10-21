@@ -7,7 +7,6 @@ and constant trace shrinkage for empirical correlation matrices.
 from dataclasses import dataclass
 import numpy as np
 import scipy.optimize as opt
-from scipy.spatial.distance import pdist, squareform
 
 
 @dataclass(frozen=True)
@@ -26,66 +25,42 @@ class MarchenkoPasturFilter:
             Ratio of sample observations to variables (T / N). Must be >= 1.0.
         """
         if q_factor < 1.0:
-            raise ValueError(f"Q factor must be >= 1.0, provided: {q_factor}")
+            raise ValueError(f"Q factor must be >= 1.0, provided: {q_factor: .2f}")
         self.q = q_factor
 
-    def compute_theoretical_bounds(self, sigma_sq: float = 1.0) -> SpectralBounds:
+    def compute_theoretical_bounds(self, sigma_sq: float = 1.0) -> tuple[float, float]:
         inv_q_sqrt = np.sqrt(1.0 / self.q)
         lambda_min = sigma_sq * (1.0 - inv_q_sqrt) ** 2
         lambda_max = sigma_sq * (1.0 + inv_q_sqrt) ** 2
-        return SpectralBounds(lambda_min=lambda_min, lambda_max=lambda_max, noise_variance=sigma_sq)
+        return lambda_min, lambda_max
 
-    def fit_empirical_sigma(self, eigenvalues: np.ndarray) -> float:
-        """
-        Fits the underlying noise variance parameter sigma^2 by minimizing the
-        squared distance between empirical noise eigenvalues and the MP law.
-        """
-        n = len(eigenvalues)
-
-        def objective(sigma_sq_candidate: float) -> float:
-            bounds = self.compute_theoretical_bounds(sigma_sq_candidate)
-            noise_eigs = eigenvalues[
-                (eigenvalues >= bounds.lambda_min) & (eigenvalues <= bounds.lambda_max)
-            ]
-            if len(noise_eigs) == 0:
-                return 1e6
-            # Theoretical variance of MP density
-            theoretical_var = (sigma_sq_candidate**2) * (
-                (1.0 + 1.0 / self.q) - (1.0 - 1.0 / self.q) ** 2 / 2.0
-            )
-            empirical_var = float(np.var(noise_eigs))
-            return (empirical_var - theoretical_var) ** 2
-
-        res = opt.minimize_scalar(objective, bounds=(1e-4, 2.0), method="bounded")
-        return float(res.x)
-
-    def denoise_correlation_matrix(self, empirical_corr: np.ndarray) -> np.ndarray:
-        """
-        Executes Constant Trace Shrinkage on the correlation matrix.
-        """
+    def denoise(self, empirical_corr: np.ndarray) -> np.ndarray:
         eigenvalues, eigenvectors = np.linalg.eigh(empirical_corr)
-        # Sort descending
         idx = np.argsort(eigenvalues)[::-1]
-        eigenvalues = np.maximum(eigenvalues[idx], 1e-12)
+        eigenvalues = np.maximum(eigenvalues[idx], 1e-10)
         eigenvectors = eigenvectors[:, idx]
 
-        sigma_sq = self.fit_empirical_sigma(eigenvalues)
-        bounds = self.compute_theoretical_bounds(sigma_sq)
+        # noise variance fit via bounded optimazition on noise bulk
+        def loss(s_cand: float) -> float:
+            l_min, l_max = self.compute_theoretical_bounds(s_cand)
+            bulk = eigenvalues[(eigenvalues >= l_min) & (eigenvalues <= l_max)]
+            if len(bulk) == 0:
+                return 1e4
+            theoretical_var = (s_cand**2) * ((1.0 + 1.0 / self.q) - (1.0 - 1.0 / self.q)**2 / 2.0)
+            return float((np.var(bulk) - theoretical_var)**2)
 
-        # Identify signals versus noise bulk
-        signal_mask = eigenvalues > bounds.lambda_max
-        num_signals = int(np.sum(signal_mask))
+        res = opt.minimize_scalar(loss, bounds=(0.01, 2.0), method="bounded")
+        sigma_sq = float(res.x)
+        _, lambda_max = self.compute_theoretical_bounds(sigma_sq)
 
+        signal_mask = eigenvalues > lambda_max
         cleaned_eigenvalues = eigenvalues.copy()
-        if num_signals < len(eigenvalues):
-            noise_average = np.mean(eigenvalues[~signal_mask])
-            cleaned_eigenvalues[~signal_mask] = noise_average
+        if np.sum(~signal_mask) > 0:
+            # constant trace preservation across noise subspace
+            cleaned_eigenvalues[~signal_mask] = np.mean(eigenvalues[~signal_mask])
 
-        # Reconstruct regularized matrix
-        reconstructed = eigenvectors @ np.diag(cleaned_eigenvalues) @ eigenvectors.T
-
-        # Re-scale diagonal to maintain exact unit correlation matrix properties
-        inv_sqrt_diag = 1.0 / np.sqrt(np.diag(reconstructed))
-        cleaned_corr = reconstructed * np.outer(inv_sqrt_diag, inv_sqrt_diag)
+        cleaned_corr = eigenvectors @ np.diag(cleaned_eigenvalues) @ eigenvectors.T
+        inv_sqrt_diag = 1.0 / np.sqrt(np.diag(cleaned_corr))
+        cleaned_corr = cleaned_corr * np.outer(inv_sqrt_diag, inv_sqrt_diag)
         np.fill_diagonal(cleaned_corr, 1.0)
         return cleaned_corr

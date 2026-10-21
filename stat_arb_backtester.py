@@ -7,17 +7,18 @@ proportional transaction costs, and dynamic stop-losses.
 from dataclasses import dataclass
 import numpy as np
 import pandas as pd
+import scipy.optimize as opt
+from ou_calibration import OrnsteinUhlenbeckEstimator
+from kalman_filter import OnlineKalmanSpreadTracker
 
 
 @dataclass
 class BacktestConfig:
-    entry_z: float = 2.0
-    exit_z: float = 0.5
-    stop_loss_z: float = 4.0
-    half_life_min: float = 2.0 / 252.0  # 2 days in years
-    half_life_max: float = 30.0 / 252.0  # 30 days in years
-    slippage_bps: float = 3.0  # 3 bps per side execution drag
-    borrow_rate_annual: float = 0.01  # 100 bps short borrow fee
+    entry_z: float = 1.80
+    exit_z: float = 0.20
+    stop_loss_z: float = 3.50
+    slippage_bps: float = 3.0 
+    borrow_rate_annual: float = 0.015
     capital_allocation: float = 1_000_000.0
 
 
@@ -38,153 +39,161 @@ class PairsBacktester:
 
     def run(
         self,
-        prices_y: np.ndarray,
-        prices_x: np.ndarray,
-        spread_series: np.ndarray,
-        betas: np.ndarray,
-        ou_half_lives: np.ndarray,
-        z_scores: np.ndarray,
-    ) -> tuple[pd.DataFrame, PerformanceMetrics]:
-        n = len(prices_y)
-        # Position states: +1: Long Y / Short X; -1: Short Y / Long X; 0: Flat
-        position = np.zeros(n, dtype=np.int8)
-        units_y = np.zeros(n, dtype=np.float64)
-        units_x = np.zeros(n, dtype=np.float64)
+        prices_df: pd.DataFrame,
+        pair_list: list[tuple[str, str]],
+    ) -> tuple[pd.DataFrame, dict]:
+        t_len = len(prices_df)
+        num_pairs = len(pair_list)
+        allocated_capital_per_pair = self.cfg.capital_allocation / num_pairs
 
-        cash = np.zeros(n, dtype=np.float64)
-        portfolio_val = np.zeros(n, dtype=np.float64)
-        cash[0] = self.cfg.capital_allocation
-        portfolio_val[0] = self.cfg.capital_allocation
+        portfolio_wealth = np.zeros(t_len)
+        portfolio_wealth[0] = self.cfg.capital_allocation
+        cash = self.cfg.capital_allocation
 
-        dt_year = 1.0 / 252.0
-        daily_borrow_factor = self.cfg.borrow_rate_annual * dt_year
-        cost_multiplier = self.cfg.slippage_bps * 1e-4
+        # state storage per pair
+        pair_data = []
+        ou_engine = OrnsteinUhlenbeckEstimator()
 
-        trade_count = 0
-        winning_trades = 0
-        in_trade = False
-        trade_entry_val = 0.0
+        for p_idx, (y_sym, x_sym) in enumerate(pair_list):
+            py = prices_df[y_sym].to_numpy()
+            px = prices_df[x_sym].to_numpy()
+            log_py = np.log(py)
+            log_px = np.log(px)
 
-        for t in range(1, n):
-            current_pos = position[t - 1]
-            z = z_scores[t - 1]
-            tau = ou_half_lives[t - 1]
-            beta = betas[t - 1]
+            kalman = OnlineKalmanSpreadTracker(process_var=1e-8, obs_var=1e-2)
+            spreads = np.zeros(t_len)
+            betas = np.zeros(t_len)
+            z_scores = np.zeros(t_len)
+            half_lives = np.zeros(t_len)
 
-            desired_pos = current_pos
+            rolling_w = 60
+            for t in range(t_len):
+                s, a, b = kalman.update(log_py[t], log_px[t])
+                spreads[t] = s
+                betas[t] = b
 
-            # Trade execution logic governed by OU half-life and z-score bounds
-            is_valid_ou = self.cfg.half_life_min <= tau <= self.cfg.half_life_max
+                if t >= rolling_w:
+                    window = spreads[t - rolling_w : t]
+                    mean_s = np.mean(window)
+                    std_s = np.std(window)
+                    z_scores[t] = (s - mean_s) / std_s if std_s > 1e-6 else 0.0
 
-            if current_pos == 0:
-                if is_valid_ou:
-                    if z <= -self.cfg.entry_z:
-                        desired_pos = 1  # Long Spread: Long Y, Short X
-                    elif z >= self.cfg.entry_z:
-                        desired_pos = -1  # Short Spread: Short Y, Long X
-            elif current_pos == 1:
-                if z >= -self.cfg.exit_z or z <= -self.cfg.stop_loss_z or not is_valid_ou:
-                    desired_pos = 0
-            elif current_pos == -1:
-                if z <= self.cfg.exit_z or z >= self.cfg.stop_loss_z or not is_valid_ou:
-                    desired_pos = 0
+                    # calibrate OU parameters every 5 days to reduce overhead
+                    if t % 5 == 0:
+                        fit_res = ou_engine.fit(window)
+                        half_lives[t] = fit_res.half_life if fit_res.is_valid else np.inf
+                    else:
+                        half_lives[t] = half_lives[t - 1]
 
-            position[t] = desired_pos
-
-            # Determine trading friction & portfolio adjustments
-            if desired_pos != current_pos:
-                trade_count += 1
-                py = prices_y[t]
-                px = prices_x[t]
-
-                # Close existing positions if altering exposure
-                if current_pos != 0:
-                    exit_val = (
-                        units_y[t - 1] * py
-                        + units_x[t - 1] * px
-                        - cost_multiplier * (np.abs(units_y[t - 1]) * py + np.abs(units_x[t - 1]) * px)
-                    )
-                    trade_pnl = exit_val - trade_entry_val
-                    if trade_pnl > 0:
-                        winning_trades += 1
-                    in_trade = False
-
-                if desired_pos != 0:
-                    # Allocate capital uniformly: 50% leg Y, 50% leg X
-                    notional = portfolio_val[t - 1] * 0.5
-                    u_y = (desired_pos * notional) / py
-                    u_x = (-desired_pos * notional * beta) / px
-
-                    # Transaction fee drag on entry
-                    fee = cost_multiplier * (np.abs(u_y) * py + np.abs(u_x) * px)
-                    cash[t] = cash[t - 1] - (u_y * py + u_x * px) - fee
-
-                    units_y[t] = u_y
-                    units_x[t] = u_x
-                    trade_entry_val = u_y * py + u_x * px
-                    in_trade = True
                 else:
-                    cash[t] = (
-                        cash[t - 1]
-                        + units_y[t - 1] * py
-                        + units_x[t - 1] * px
-                        - cost_multiplier
-                        * (np.abs(units_y[t - 1]) * py + np.abs(units_x[t - 1]) * px)
-                    )
-                    units_y[t] = 0.0
-                    units_x[t] = 0.0
-            else:
-                # Retain open holdings
-                units_y[t] = units_y[t - 1]
-                units_x[t] = units_x[t - 1]
-                cash[t] = cash[t - 1]
+                    z_scores[t] = 0.0
+                    half_lives[t] = np.inf
 
-                # Deduct borrow fee on short equity legs
-                short_liability = 0.0
-                if units_y[t] < 0:
-                    short_liability += np.abs(units_y[t]) * prices_y[t]
-                if units_x[t] < 0:
-                    short_liability += np.abs(units_x[t]) * prices_x[t]
+            pair_data.append({
+                "y_sym": y_sym, "x_sym": x_sym,
+                "py": py, "px": px,
+                "spread": spreads, "beta": betas,
+                "z": z_scores, "hl": half_lives,
+                "pos": 0, "units_y": 0.0, "units_x":0.0,
+                "entry_bar": 0, "max_holding_bars": 0,
+            })
 
-                cash[t] -= short_liability * daily_borrow_factor
+        # portfolio sim loop
+        daily_borrow = self.cfg.borrow_rate_annual / 252.0
+        cost_rate = self.cfg.slippage_bps * 1e-4
+        total_trades = 0
+        winning_trades = 0
 
-            portfolio_val[t] = cash[t] + units_y[t] * prices_y[t] + units_x[t] * prices_x[t]
+        for t in range(1, t_len):
+            current_portfolio_positions_val = 0.0
 
-        # Calculate performance statistics
-        returns = np.diff(portfolio_val) / portfolio_val[:-1]
-        total_ret = (portfolio_val[-1] - portfolio_val[0]) / portfolio_val[0]
-        n_years = n / 252.0
-        cagr = (portfolio_val[-1] / portfolio_val[0]) ** (1.0 / n_years) - 1.0
-        vol = float(np.std(returns) * np.sqrt(252.0))
-        sharpe = float((cagr - 0.02) / vol) if vol > 1e-6 else 0.0
+            for p_info in pair_data:
+                z = p_info["z"][t - 1]
+                pos = p_info["pos"]
+                hl = p_info["hl"][t - 1]
+                py_t = p_info["py"][t]
+                px_t = p_info["px"][t]
+                beta_t = p_info["beta"][t - 1]
 
-        cum_max = np.maximum.accumulate(portfolio_val)
-        drawdowns = (portfolio_val - cum_max) / cum_max
+                holding_time = t - p_info["entry_bar"]
+                time_stop_triggered = (pos != 0) and (holding_time >= p_info["max_holding_bars"])
+
+                target_pos = pos
+
+                if pos ==0:
+                    # entry check
+                    if (hl < np.inf) and (np.abs(z) >= self.cfg.entry_z):
+                        target_pos = 1 if (z <= -self.cfg.entry_z) else -1
+                        # max holding period set to 2.5x mean-reversion hl
+                        p_info["max_holding_bars"] = int(np.clip(2.5 * hl * 252.0, 5, 45))
+                        p_info["entry_bar"] = t
+                elif pos == 1:
+                    # exit condition
+                    if (z>= -self.cfg.exit_z) or (z <= -self.cfg.stop_loss_z) or time_stop_triggered:
+                        target_pos = 0
+                elif pos == -1:
+                    if (z <= self.cfg.exit_z) or (z >= self.cfg.stop_loss_z) or time_stop_triggered:
+                        target_pos = 0
+
+                if target_pos != pos:
+                    total_trades += 1
+                    # close exit exposure
+                    if pos != 0:
+                        gross_exit = p_info["units_y"] * py_t + p_info["units_x"] * px_t
+                        friction = cost_rate * (np.abs(p_info["units_y"]) * py_t + np.abs(p_info["units_x"]) * px_t)
+                        realized_pnl = gross_exit - friction
+                        cash += gross_exit -friction
+                        if realized_pnl > 0:
+                            winning_trades += 1
+                        p_info["units_y"] = 0.0
+                        p_info["units_x"] = 0.0
+
+                    # open new exposure
+                    if target_pos != 0:
+                        half_alloc = allocated_capital_per_pair * 0.5
+                        uy = (target_pos * half_alloc) / py_t
+                        ux = (-target_pos * half_alloc * beta_t) / px_t
+                        friction = cost_rate * (np.abs(uy) * py_t + np.abs(ux) * px_t)
+
+                        cash -= (uy * py_t + ux * px_t) + friction
+                        p_info["units_y"] = uy
+                        p_info["units_x"] = ux
+                        p_info["pos"] = target_pos
+                    else:
+                        p_info["pos"] = 0
+
+                # short borrow costs
+                short_val = 0.0
+                if p_info["units_y"] < 0:
+                    short_val += np.abs(p_info["units_y"]) * py_t
+                if p_info["units_x"] < 0:
+                    short_val += np.abs(p_info["units_x"]) * px_t
+                cash -= short_val * daily_borrow
+
+                current_portfolio_positions_val += p_info["units_y"] * py_t + p_info["units_x"] * px_t
+
+            portfolio_wealth[t] = cash + current_portfolio_positions_val
+
+        # quantitative metric
+        returns = np.diff(portfolio_wealth) / portfolio_wealth[:-1]
+        total_ret = (portfolio_wealth[-1] - portfolio_wealth[0]) / portfolio_wealth[0]
+        n_years = t_len / 252.0
+        cagr = (portfolio_wealth[-1] / portfolio_wealth[0]) ** (1.0 / n_years) - 1.0
+        ann_vol = float(np.std(returns) * np.sqrt(252.0))
+        sharpe = float((cagr - 0.02) / ann_vol) if ann_vol > 1e-4 else 0.0
+
+        acum_peak = np.maximum.accumulate(portfolio_wealth)
+        drawdowns = (portfolio_wealth - acum_peak) / acum_peak
         max_dd = float(np.min(drawdowns))
-        win_rate = float(winning_trades / (trade_count // 2)) if trade_count >= 2 else 0.0
+        win_rate = float(winning_trades / (total_trades / 2.0)) if total_trades >= 2 else 0.0
 
-        metrics = PerformanceMetrics(
-            total_return=total_ret,
-            cagr=cagr,
-            annualized_volatility=vol,
-            sharpe_ratio=sharpe,
-            max_drawdown=max_dd,
-            win_rate=win_rate,
-            total_trades=trade_count // 2,
-        )
-
-        df_out = pd.DataFrame(
-            {
-                "PortfolioValue": portfolio_val,
-                "Position": position,
-                "Spread": spread_series,
-                "ZScore": z_scores,
-                "UnitsY": units_y,
-                "UnitsX": units_x,
-                "Beta": betas,
-                "HalfLife": ou_half_lives,
-            }
-        )
-
-        return df_out, metrics
-    
+        metrics = {
+            "Total Return": total_ret,
+            "CAGR": cagr,
+            "Annualized Volatility": ann_vol,
+            "Sharpe Ratio": sharpe,
+            "Max Drawdown": max_dd,
+            "Completed Trades": int(total_trades // 2),
+            "Win Rate": win_rate,
+        }
+        return pd.DataFrame({"Wealth": portfolio_wealth}), metrics
