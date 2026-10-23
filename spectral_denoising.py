@@ -35,30 +35,37 @@ class MarchenkoPasturFilter:
         return lambda_min, lambda_max
 
     def denoise(self, empirical_corr: np.ndarray) -> np.ndarray:
+        n_assets = empirical_corr.shape[0]
         eigenvalues, eigenvectors = np.linalg.eigh(empirical_corr)
+
+        # sort eigenvalues in descending order
         idx = np.argsort(eigenvalues)[::-1]
         eigenvalues = np.maximum(eigenvalues[idx], 1e-10)
         eigenvectors = eigenvectors[:, idx]
 
-        # noise variance fit via bounded optimazition on noise bulk
-        def loss(s_cand: float) -> float:
-            l_min, l_max = self.compute_theoretical_bounds(s_cand)
-            bulk = eigenvalues[(eigenvalues >= l_min) & (eigenvalues <= l_max)]
-            if len(bulk) == 0:
-                return 1e4
-            theoretical_var = (s_cand**2) * ((1.0 + 1.0 / self.q) - (1.0 - 1.0 / self.q)**2 / 2.0)
-            return float((np.var(bulk) - theoretical_var)**2)
+        # iterative check via noise trace conservation
+        k_signals = 0
+        for candidate_k in range(n_assets):
+            if candidate_k == 0:
+                sigma_sq = 1.0
+            else:
+                # distribute residual trace uniformly over candidate noise modes
+                sigma_sq = float((n_assets - np.sum(eigenvalues[:candidate_k]))/ (n_assets - candidate_k))
 
-        res = opt.minimize_scalar(loss, bounds=(0.01, 2.0), method="bounded")
-        sigma_sq = float(res.x)
-        _, lambda_max = self.compute_theoretical_bounds(sigma_sq)
+            _, lambda_max = self.compute_theoretical_bounds(sigma_sq)
+            if eigenvalues[candidate_k] <= lambda_max:
+                k_signals = candidate_k
+                break
 
-        signal_mask = eigenvalues > lambda_max
+        # apply constant trace shrinkage across noise subspace
         cleaned_eigenvalues = eigenvalues.copy()
-        if np.sum(~signal_mask) > 0:
-            # constant trace preservation across noise subspace
-            cleaned_eigenvalues[~signal_mask] = np.mean(eigenvalues[~signal_mask])
+        if k_signals < n_assets:
+            cleaned_eigenvalues[k_signals:] = np.mean(eigenvalues[k_signals:])
 
+        # reconstruct correlation matrix
+        cleaned_corr = eigenvectors @ np.diag(cleaned_eigenvalues) @ eigenvectors.T
+
+        # normalize diagonal to 1.0
         cleaned_corr = eigenvectors @ np.diag(cleaned_eigenvalues) @ eigenvectors.T
         inv_sqrt_diag = 1.0 / np.sqrt(np.diag(cleaned_corr))
         cleaned_corr = cleaned_corr * np.outer(inv_sqrt_diag, inv_sqrt_diag)

@@ -54,7 +54,7 @@ class PairsBacktester:
         pair_data = []
         ou_engine = OrnsteinUhlenbeckEstimator()
 
-        for p_idx, (y_sym, x_sym) in enumerate(pair_list):
+        for y_sym, x_sym in pair_list:
             py = prices_df[y_sym].to_numpy()
             px = prices_df[x_sym].to_numpy()
             log_py = np.log(py)
@@ -84,7 +84,6 @@ class PairsBacktester:
                         half_lives[t] = fit_res.half_life if fit_res.is_valid else np.inf
                     else:
                         half_lives[t] = half_lives[t - 1]
-
                 else:
                     z_scores[t] = 0.0
                     half_lives[t] = np.inf
@@ -96,6 +95,7 @@ class PairsBacktester:
                 "z": z_scores, "hl": half_lives,
                 "pos": 0, "units_y": 0.0, "units_x":0.0,
                 "entry_bar": 0, "max_holding_bars": 0,
+                "entry_cost": 0.0,
             })
 
         # portfolio sim loop
@@ -136,29 +136,37 @@ class PairsBacktester:
                         target_pos = 0
 
                 if target_pos != pos:
-                    total_trades += 1
                     # close exit exposure
                     if pos != 0:
                         gross_exit = p_info["units_y"] * py_t + p_info["units_x"] * px_t
-                        friction = cost_rate * (np.abs(p_info["units_y"]) * py_t + np.abs(p_info["units_x"]) * px_t)
-                        realized_pnl = gross_exit - friction
-                        cash += gross_exit -friction
-                        if realized_pnl > 0:
+                        friction_exit = cost_rate * (np.abs(p_info["units_y"]) * py_t + np.abs(p_info["units_x"]) * px_t)
+                        net_exit = gross_exit - friction_exit
+                        cash += gross_exit -friction_exit
+
+
+                        # realized net round-trip trade profit
+                        realized_pnl = (gross_exit - friction_exit) - p_info["entry_cost"]
+                        total_trades += 1
+                        if realized_pnl > 0.0:
                             winning_trades += 1
+
                         p_info["units_y"] = 0.0
                         p_info["units_x"] = 0.0
+                        p_info["entry_cost"] = 0.0
 
                     # open new exposure
                     if target_pos != 0:
                         half_alloc = allocated_capital_per_pair * 0.5
                         uy = (target_pos * half_alloc) / py_t
                         ux = (-target_pos * half_alloc * beta_t) / px_t
-                        friction = cost_rate * (np.abs(uy) * py_t + np.abs(ux) * px_t)
+                        friction_entry = cost_rate * (np.abs(uy) * py_t + np.abs(ux) * px_t)
+                        gross = uy * py_t + ux * px_t
 
-                        cash -= (uy * py_t + ux * px_t) + friction
+                        cash -= gross + friction_entry
                         p_info["units_y"] = uy
                         p_info["units_x"] = ux
                         p_info["pos"] = target_pos
+                        p_info["entry_cost"] = gross + friction_entry
                     else:
                         p_info["pos"] = 0
 
@@ -176,7 +184,9 @@ class PairsBacktester:
 
         # quantitative metric
         returns = np.diff(portfolio_wealth) / portfolio_wealth[:-1]
-        total_ret = (portfolio_wealth[-1] - portfolio_wealth[0]) / portfolio_wealth[0]
+        total_ret = float(
+            (portfolio_wealth[-1] - portfolio_wealth[0]) / portfolio_wealth[0]
+        )
         n_years = t_len / 252.0
         cagr = (portfolio_wealth[-1] / portfolio_wealth[0]) ** (1.0 / n_years) - 1.0
         ann_vol = float(np.std(returns) * np.sqrt(252.0))
@@ -185,7 +195,11 @@ class PairsBacktester:
         acum_peak = np.maximum.accumulate(portfolio_wealth)
         drawdowns = (portfolio_wealth - acum_peak) / acum_peak
         max_dd = float(np.min(drawdowns))
-        win_rate = float(winning_trades / (total_trades / 2.0)) if total_trades >= 2 else 0.0
+        win_rate = (
+            float(winning_trades / total_trades) 
+            if total_trades >0 
+            else 0.0
+        )
 
         metrics = {
             "Total Return": total_ret,
@@ -193,7 +207,7 @@ class PairsBacktester:
             "Annualized Volatility": ann_vol,
             "Sharpe Ratio": sharpe,
             "Max Drawdown": max_dd,
-            "Completed Trades": int(total_trades // 2),
+            "Completed Trades": total_trades,
             "Win Rate": win_rate,
         }
         return pd.DataFrame({"Wealth": portfolio_wealth}), metrics
