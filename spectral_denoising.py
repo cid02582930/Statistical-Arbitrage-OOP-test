@@ -64,9 +64,6 @@ class MarchenkoPasturFilter:
 
         # reconstruct correlation matrix
         cleaned_corr = eigenvectors @ np.diag(cleaned_eigenvalues) @ eigenvectors.T
-
-        # normalize diagonal to 1.0
-        cleaned_corr = eigenvectors @ np.diag(cleaned_eigenvalues) @ eigenvectors.T
         inv_sqrt_diag = 1.0 / np.sqrt(np.diag(cleaned_corr))
         cleaned_corr = cleaned_corr * np.outer(inv_sqrt_diag, inv_sqrt_diag)
         np.fill_diagonal(cleaned_corr, 1.0)
